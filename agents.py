@@ -1,21 +1,26 @@
 """
 agents.py
 
-Two collaborating agents for CS305 Course Project Evaluation #1:
+Three collaborating agents for CS305 Course Project Evaluation #1:
 
-  1. RequirementsAgent  - reads a plain-English project scenario and produces
-                          a structured list of functional and non-functional
-                          software requirements.
+  0. ClarificationAgent - reads the raw scenario FIRST and decides whether
+                          it has enough detail to produce complete,
+                          unambiguous requirements. If not, it asks up to a
+                          handful of targeted questions instead of letting
+                          the next agent silently guess.
+  1. RequirementsAgent  - reads the (possibly clarified) scenario and
+                          produces a structured list of functional and
+                          non-functional software requirements.
   2. SDLCAgent          - reads the scenario + the requirements produced by
                           RequirementsAgent, reasons about project
                           characteristics (regulatory criticality, change
                           frequency, risk, etc.), and recommends a suitable
                           SDLC model with justification.
 
-An Orchestrator class runs them in sequence, passing Agent 1's output into
-Agent 2 -- this is the minimal "multi-agent" pattern: independent agents
-with their own role/system-prompt, coordinated by a controller, exchanging
-structured messages.
+An Orchestrator class runs them in sequence: Clarification -> Requirements
+-> SDLC, passing each agent's output into the next -- this is the minimal
+"multi-agent" pattern: independent agents with their own role/system-prompt,
+coordinated by a controller, exchanging structured messages.
 
 No fine-tuning and no training dataset are used. Both agents call a
 Hugging Face hosted instruction-tuned model through the Inference API
@@ -59,6 +64,86 @@ def _extract_json(text: str) -> Optional[dict]:
         return json.loads(candidate)
     except json.JSONDecodeError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Agent 0: Clarification Agent
+# ---------------------------------------------------------------------------
+
+CLARIFICATION_SYSTEM_PROMPT = """You are the Clarification Agent, the first \
+specialised AI agent in a multi-agent software-engineering assistant used in \
+the financial sector. Your sole responsibility is to judge whether a project \
+scenario has ENOUGH detail for a Requirements Agent to produce complete, \
+unambiguous requirements -- BEFORE any requirements are written.
+
+Check specifically for critical gaps such as:
+- Who the users/actors/roles are
+- Sensitivity/type of data involved (PII, financial, health, etc.)
+- Expected scale/volume or performance expectations
+- Integration points with existing systems
+- Regulatory or compliance context
+- Platform/deployment context (web, mobile, both, on-prem, cloud)
+
+If the scenario is reasonably clear, say so and ask nothing -- do NOT invent
+questions just to have some. Only ask about gaps that would materially
+change what requirements get written. Ask at most 4 questions, each short
+and specific (not generic like "please provide more details").
+
+Respond with ONLY a single valid JSON object, no prose before or after it,
+in exactly this shape:
+
+{
+  "sufficient": true or false,
+  "reasoning": "<one sentence explaining your judgment>",
+  "questions": ["...", "..."]
+}
+
+If "sufficient" is true, "questions" must be an empty list.
+"""
+
+
+@dataclass
+class ClarificationOutput:
+    sufficient: bool
+    reasoning: str
+    questions: list
+    raw_text: str = field(repr=False, default="")
+
+
+class ClarificationAgent:
+    """Agent 0: decides if the scenario is detailed enough, or asks questions."""
+
+    def __init__(self, client: InferenceClient, model: str = DEFAULT_MODEL):
+        self.client = client
+        self.model = model
+
+    def run(self, scenario: str) -> ClarificationOutput:
+        messages = [
+            {"role": "system", "content": CLARIFICATION_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Project scenario:\n{scenario}"},
+        ]
+        response = self.client.chat_completion(
+            messages=messages, model=self.model, max_tokens=500, temperature=0.2
+        )
+        text = response.choices[0].message.content
+        data = _extract_json(text)
+
+        if data is None:
+            # Fail safe: if we can't parse the judgment, assume it's
+            # sufficient rather than blocking the whole pipeline.
+            return ClarificationOutput(
+                sufficient=True,
+                reasoning="Could not parse clarification judgment; proceeding anyway.",
+                questions=[],
+                raw_text=text,
+            )
+
+        return ClarificationOutput(
+            sufficient=bool(data.get("sufficient", True)),
+            reasoning=data.get("reasoning", ""),
+            questions=data.get("questions", []) or [],
+            raw_text=text,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -154,18 +239,46 @@ sector. You do NOT gather requirements yourself -- you receive already-\
 extracted requirements from the Requirements Agent and decide on a suitable \
 Software Development Life Cycle (SDLC) model.
 
-Base your reasoning on standard software engineering heuristics, for example:
-- Stable requirements, heavy up-front approvals -> Waterfall
-- Strict verification & validation needs -> V-Model
-- High technical/uncertainty risk -> Spiral
-- Frequently changing requirements, need for fast iteration -> Agile
-- Continuous secure deployment, strong security automation needs -> DevSecOps
-- High regulation AND evolving requirements -> Agile-V-Model or Agile-DevSecOps hybrid
+You must choose ONLY from this exact set of SDLC models (the standard set \
+taught in this course) -- do not invent other names and do not default to \
+Agile just because it is common:
+
+- Waterfall: stable, well-understood requirements; heavy up-front sign-off; \
+low expected change; sequential phases with no overlap.
+- Iterative Waterfall: like Waterfall, but with feedback loops back to \
+earlier phases allowed -- used when requirements are mostly clear but some \
+rework between adjacent phases is expected.
+- V-Shaped: requirements are stable AND verification/validation rigor is \
+paramount (e.g. safety- or compliance-critical, every requirement must map \
+to a specific test phase).
+- Prototype: requirements or the user interface/interaction design are \
+unclear, unfamiliar, or need to be experienced to be evaluated properly; a \
+quick, rough working model is needed early (e.g. for demos, user feedback, \
+a trade show/deadline, an unfamiliar product form factor) before committing \
+to the full build.
+- RAD (Rapid Application Development): very tight timeline, requirements \
+fairly clear, heavy reuse/components, willing to trade some rigor for speed.
+- Incremental/Iterative: requirements are reasonably well understood as a \
+whole, but the system can and should be delivered in usable pieces/\
+increments over time.
+- Spiral: high technical or business risk and/or high uncertainty, large or \
+expensive project, needs repeated risk-analysis cycles before committing \
+further investment.
+- Agile: requirements are expected to change frequently during development \
+and the team needs continuous stakeholder feedback and fast iteration.
+
+Do not force-fit Agile onto every scenario. If the strongest signal in the \
+requirements is "we need a quick working model to show/test before \
+committing further" (a demo, a prototype, an experimental UI/hardware \
+combination, a tight deadline to demonstrate feasibility, an unfamiliar \
+product area), Prototype is very likely the correct answer even in a \
+financial-sector context. If strict regulatory sign-off and traceable \
+testing dominate, prefer V-Shaped or Waterfall/Iterative Waterfall over \
+Agile even if the domain is "modern".
 
 Given the scenario and its requirements, you must:
-1. Score how well each of Waterfall, V-Model, Spiral, Agile, DevSecOps, and \
-a Hybrid model fit this project (0-100).
-2. Pick the best-fitting model (or hybrid) and justify the choice using the \
+1. Score how well each of the 8 models above fits this project (0-100).
+2. Pick the single best-fitting model and justify the choice using the \
 specific requirements you were given.
 3. Sketch a short project-specific workflow: 4-6 phases with 1-2 key \
 activities each, appropriate to a financial/regulated context.
@@ -174,7 +287,7 @@ Respond with ONLY a single valid JSON object, no prose before or after it, \
 in exactly this shape:
 
 {
-  "scores": {"Waterfall": 0, "V-Model": 0, "Spiral": 0, "Agile": 0, "DevSecOps": 0, "Hybrid": 0},
+  "scores": {"Waterfall": 0, "Iterative Waterfall": 0, "V-Shaped": 0, "Prototype": 0, "RAD": 0, "Incremental/Iterative": 0, "Spiral": 0, "Agile": 0},
   "recommended_model": "<name>",
   "justification": "<2-4 sentences tying the recommendation to the specific requirements>",
   "workflow": [
@@ -271,10 +384,25 @@ class Orchestrator:
         if provider:
             client_kwargs["provider"] = provider
         self.client = InferenceClient(**client_kwargs)
+        self.clarification_agent = ClarificationAgent(self.client, model=model)
         self.requirements_agent = RequirementsAgent(self.client, model=model)
         self.sdlc_agent = SDLCAgent(self.client, model=model)
 
+    @staticmethod
+    def merge_answers(scenario: str, questions: list, answers: list) -> str:
+        """Fold clarifying Q&A pairs back into the scenario text so the
+        Requirements Agent sees them as additional context."""
+        qa_block = "\n".join(
+            f"Q: {q}\nA: {a}" for q, a in zip(questions, answers) if a and a.strip()
+        )
+        if not qa_block:
+            return scenario
+        return f"{scenario}\n\nAdditional clarifications:\n{qa_block}"
+
     def run(self, scenario: str):
+        """Runs the full pipeline without stopping for clarification --
+        useful for the CLI / batch use. The Streamlit app instead calls the
+        agents individually so it can pause and show questions in the UI."""
         requirements = self.requirements_agent.run(scenario)
         sdlc = self.sdlc_agent.run(scenario, requirements)
         return requirements, sdlc
