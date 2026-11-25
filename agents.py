@@ -1,60 +1,104 @@
 """
 agents.py
 
-Three collaborating agents for CS305 Course Project Evaluation #1:
+Three collaborating agents for CS305 Course Project Evaluation #1,
+now with optional RAG (Retrieval-Augmented Generation) support:
 
   0. ClarificationAgent - reads the raw scenario FIRST and decides whether
                           it has enough detail to produce complete,
                           unambiguous requirements. If not, it asks up to a
-                          handful of targeted questions instead of letting
-                          the next agent silently guess.
+                          handful of targeted questions.
   1. RequirementsAgent  - reads the (possibly clarified) scenario and
                           produces a structured list of functional and
                           non-functional software requirements.
   2. SDLCAgent          - reads the scenario + the requirements produced by
                           RequirementsAgent, reasons about project
-                          characteristics (regulatory criticality, change
-                          frequency, risk, etc.), and recommends a suitable
-                          SDLC model with justification.
+                          characteristics, and recommends a suitable SDLC
+                          model with justification.
+
+When a domain is selected (e.g. Banking, Healthcare, E-Commerce), the
+agents receive retrieved domain-specific context from a local vector store
+(see rag.py), grounding their responses in real regulations, standards,
+and best practices rather than relying solely on the LLM's training data.
 
 An Orchestrator class runs them in sequence: Clarification -> Requirements
--> SDLC, passing each agent's output into the next -- this is the minimal
-"multi-agent" pattern: independent agents with their own role/system-prompt,
-coordinated by a controller, exchanging structured messages.
+-> SDLC, passing each agent's output into the next.
 
-No fine-tuning and no training dataset are used. Both agents call a
-Hugging Face hosted instruction-tuned model through the Inference API
-(huggingface_hub.InferenceClient). This is "agentic" in the sense used by
-the assignment: separate agents with distinct responsibilities, each
-invoking an LLM, coordinated to produce a joint deliverable.
+All agents call the Google Gemini REST API directly (no SDK with native
+DLLs required -- just the 'requests' library).
 """
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from huggingface_hub import InferenceClient
+import requests
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Any instruction-tuned chat model available on your Hugging Face Inference
-# provider works here. If one model is unavailable/rate-limited on your
-# account, swap this string for another (e.g. a smaller model) -- nothing
-# else in the code needs to change.
-DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
+
+GEMINI_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
+
+
+FALLBACK_MODELS = []  # optional: extra model names to try if the chosen one stays overloaded
+RETRY_STATUSES = (429, 500, 503)
+
+
+def _call_gemini(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_message: str,
+    max_tokens: int = 800,
+    temperature: float = 0.3,
+) -> str:
+    """Call the Gemini REST API (with retries) and return the text response."""
+    payload = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": temperature,
+        },
+    }
+    resp = None
+    for m in [model] + [f for f in FALLBACK_MODELS if f != model]:
+        url = GEMINI_API_URL.format(model=m)
+        for attempt in range(4):
+            try:
+                resp = requests.post(
+                    url, params={"key": api_key}, json=payload, timeout=120
+                )
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                resp = None  # treat like a busy server and retry
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            if resp.status_code not in RETRY_STATUSES:
+                break
+            time.sleep(min(2 ** attempt, 8))  # 1s, 2s, 4s, 8s
+        if resp is not None and resp.status_code not in RETRY_STATUSES:
+            break  # success or a real error (404, 400...) -> don't try other models
+    if resp is None:
+        raise RuntimeError("Gemini did not respond (timeouts). Try again or switch model.")
+    resp.raise_for_status()
+    data = resp.json()
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return ""
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts)
 
 
 def _extract_json(text: str) -> Optional[dict]:
-    """Best-effort extraction of a JSON object from an LLM response.
-
-    Models sometimes wrap JSON in prose or markdown code fences. This finds
-    the first {...} block and tries to parse it; falls back to None so the
-    caller can show the raw text instead of crashing.
-    """
+    """Best-effort extraction of a JSON object from an LLM response."""
     text = text.strip()
     text = re.sub(r"^```(json)?", "", text.strip(), flags=re.IGNORECASE).strip()
     text = re.sub(r"```$", "", text.strip()).strip()
@@ -71,10 +115,15 @@ def _extract_json(text: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 CLARIFICATION_SYSTEM_PROMPT = """You are the Clarification Agent, the first \
-specialised AI agent in a multi-agent software-engineering assistant used in \
-the financial sector. Your sole responsibility is to judge whether a project \
-scenario has ENOUGH detail for a Requirements Agent to produce complete, \
-unambiguous requirements -- BEFORE any requirements are written.
+specialised AI agent in a multi-agent software-engineering assistant. Your \
+sole responsibility is to judge whether a project scenario has ENOUGH detail \
+for a Requirements Agent to produce complete, unambiguous requirements -- \
+BEFORE any requirements are written.
+
+If domain-specific knowledge has been retrieved and provided alongside the \
+scenario, USE it to identify gaps more precisely -- for example, if the \
+domain knowledge mentions specific regulations or standards that the \
+scenario doesn't address, ask about those.
 
 Check specifically for critical gaps such as:
 - Who the users/actors/roles are
@@ -113,24 +162,26 @@ class ClarificationOutput:
 class ClarificationAgent:
     """Agent 0: decides if the scenario is detailed enough, or asks questions."""
 
-    def __init__(self, client: InferenceClient, model: str = DEFAULT_MODEL):
-        self.client = client
+    def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
+        self.api_key = api_key
         self.model = model
 
-    def run(self, scenario: str) -> ClarificationOutput:
-        messages = [
-            {"role": "system", "content": CLARIFICATION_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Project scenario:\n{scenario}"},
-        ]
-        response = self.client.chat_completion(
-            messages=messages, model=self.model, max_tokens=500, temperature=0.2
+    def run(self, scenario: str, domain_context: str = "") -> ClarificationOutput:
+        user_msg = f"Project scenario:\n{scenario}"
+        if domain_context:
+            user_msg += f"\n\n{domain_context}"
+
+        text = _call_gemini(
+            api_key=self.api_key,
+            model=self.model,
+            system_prompt=CLARIFICATION_SYSTEM_PROMPT,
+            user_message=user_msg,
+            max_tokens=500,
+            temperature=0.2,
         )
-        text = response.choices[0].message.content
         data = _extract_json(text)
 
         if data is None:
-            # Fail safe: if we can't parse the judgment, assume it's
-            # sufficient rather than blocking the whole pipeline.
             return ClarificationOutput(
                 sufficient=True,
                 reasoning="Could not parse clarification judgment; proceeding anyway.",
@@ -151,8 +202,15 @@ class ClarificationAgent:
 # ---------------------------------------------------------------------------
 
 REQUIREMENTS_SYSTEM_PROMPT = """You are the Requirements Agent, a specialised AI \
-agent in a multi-agent software-engineering assistant used in the financial \
-sector. Your sole responsibility is requirement elicitation and structuring.
+agent in a multi-agent software-engineering assistant. Your sole \
+responsibility is requirement elicitation and structuring.
+
+If domain-specific knowledge has been retrieved and provided alongside the \
+scenario, you MUST use it to produce domain-aware requirements. Reference \
+specific regulations, standards, or best practices from the retrieved \
+context when they apply to the scenario. For example, if the domain \
+knowledge mentions HIPAA, PCI-DSS, KYC/AML, or specific compliance \
+requirements, include corresponding non-functional requirements.
 
 Given a plain-English description of a project, module, or feature, you must:
 1. Identify the functional requirements (what the system must do).
@@ -195,23 +253,26 @@ class RequirementsOutput:
 class RequirementsAgent:
     """Agent 1: turns a scenario description into structured requirements."""
 
-    def __init__(self, client: InferenceClient, model: str = DEFAULT_MODEL):
-        self.client = client
+    def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
+        self.api_key = api_key
         self.model = model
 
-    def run(self, scenario: str) -> RequirementsOutput:
-        messages = [
-            {"role": "system", "content": REQUIREMENTS_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Project scenario:\n{scenario}"},
-        ]
-        response = self.client.chat_completion(
-            messages=messages, model=self.model, max_tokens=900, temperature=0.3
+    def run(self, scenario: str, domain_context: str = "") -> RequirementsOutput:
+        user_msg = f"Project scenario:\n{scenario}"
+        if domain_context:
+            user_msg += f"\n\n{domain_context}"
+
+        text = _call_gemini(
+            api_key=self.api_key,
+            model=self.model,
+            system_prompt=REQUIREMENTS_SYSTEM_PROMPT,
+            user_message=user_msg,
+            max_tokens=1200,
+            temperature=0.3,
         )
-        text = response.choices[0].message.content
         data = _extract_json(text)
 
         if data is None:
-            # Graceful fallback: still return something usable for the demo
             return RequirementsOutput(
                 scenario_summary=scenario[:200],
                 functional_requirements=[],
@@ -234,10 +295,15 @@ class RequirementsAgent:
 # ---------------------------------------------------------------------------
 
 SDLC_SYSTEM_PROMPT = """You are the SDLC Selection Agent, a specialised AI \
-agent in a multi-agent software-engineering assistant used in the financial \
-sector. You do NOT gather requirements yourself -- you receive already-\
-extracted requirements from the Requirements Agent and decide on a suitable \
-Software Development Life Cycle (SDLC) model.
+agent in a multi-agent software-engineering assistant. You do NOT gather \
+requirements yourself -- you receive already-extracted requirements from \
+the Requirements Agent and decide on a suitable Software Development Life \
+Cycle (SDLC) model.
+
+If domain-specific knowledge has been retrieved and provided alongside the \
+scenario, USE it to inform your SDLC recommendation. For example, heavily \
+regulated domains (banking, healthcare) with strict audit and compliance \
+requirements may favour V-Shaped or Iterative Waterfall over Agile.
 
 You must choose ONLY from this exact set of SDLC models (the standard set \
 taught in this course) -- do not invent other names and do not default to \
@@ -281,7 +347,7 @@ Given the scenario and its requirements, you must:
 2. Pick the single best-fitting model and justify the choice using the \
 specific requirements you were given.
 3. Sketch a short project-specific workflow: 4-6 phases with 1-2 key \
-activities each, appropriate to a financial/regulated context.
+activities each, appropriate to the domain context.
 
 Respond with ONLY a single valid JSON object, no prose before or after it, \
 in exactly this shape:
@@ -327,26 +393,28 @@ class SDLCOutput:
 class SDLCAgent:
     """Agent 2: recommends an SDLC model from a scenario + requirements."""
 
-    def __init__(self, client: InferenceClient, model: str = DEFAULT_MODEL):
-        self.client = client
+    def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
+        self.api_key = api_key
         self.model = model
 
-    def run(self, scenario: str, requirements: RequirementsOutput) -> SDLCOutput:
+    def run(self, scenario: str, requirements: RequirementsOutput,
+            domain_context: str = "") -> SDLCOutput:
         req_block = requirements.as_markdown()
-        messages = [
-            {"role": "system", "content": SDLC_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Project scenario:\n{scenario}\n\n"
-                    f"Requirements extracted by the Requirements Agent:\n{req_block}"
-                ),
-            },
-        ]
-        response = self.client.chat_completion(
-            messages=messages, model=self.model, max_tokens=900, temperature=0.3
+        user_msg = (
+            f"Project scenario:\n{scenario}\n\n"
+            f"Requirements extracted by the Requirements Agent:\n{req_block}"
         )
-        text = response.choices[0].message.content
+        if domain_context:
+            user_msg += f"\n\n{domain_context}"
+
+        text = _call_gemini(
+            api_key=self.api_key,
+            model=self.model,
+            system_prompt=SDLC_SYSTEM_PROMPT,
+            user_message=user_msg,
+            max_tokens=1000,
+            temperature=0.3,
+        )
         data = _extract_json(text)
 
         if data is None:
@@ -368,25 +436,22 @@ class SDLCAgent:
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator: coordinates the two agents
+# Orchestrator: coordinates the three agents
 # ---------------------------------------------------------------------------
 
 class Orchestrator:
-    """Runs the two agents in sequence, passing Agent 1's output to Agent 2.
+    """Runs the three agents in sequence, passing each agent's output to the next.
 
     This is the "coordinator" role described in multi-agent architectures:
     it owns execution order and hands structured context from one agent to
     the next.
     """
 
-    def __init__(self, hf_token: str, model: str = DEFAULT_MODEL, provider: Optional[str] = None):
-        client_kwargs = {"api_key": hf_token}
-        if provider:
-            client_kwargs["provider"] = provider
-        self.client = InferenceClient(**client_kwargs)
-        self.clarification_agent = ClarificationAgent(self.client, model=model)
-        self.requirements_agent = RequirementsAgent(self.client, model=model)
-        self.sdlc_agent = SDLCAgent(self.client, model=model)
+    def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
+        self.api_key = api_key
+        self.clarification_agent = ClarificationAgent(api_key=api_key, model=model)
+        self.requirements_agent = RequirementsAgent(api_key=api_key, model=model)
+        self.sdlc_agent = SDLCAgent(api_key=api_key, model=model)
 
     @staticmethod
     def merge_answers(scenario: str, questions: list, answers: list) -> str:
@@ -399,10 +464,10 @@ class Orchestrator:
             return scenario
         return f"{scenario}\n\nAdditional clarifications:\n{qa_block}"
 
-    def run(self, scenario: str):
+    def run(self, scenario: str, domain_context: str = ""):
         """Runs the full pipeline without stopping for clarification --
         useful for the CLI / batch use. The Streamlit app instead calls the
         agents individually so it can pause and show questions in the UI."""
-        requirements = self.requirements_agent.run(scenario)
-        sdlc = self.sdlc_agent.run(scenario, requirements)
+        requirements = self.requirements_agent.run(scenario, domain_context)
+        sdlc = self.sdlc_agent.run(scenario, requirements, domain_context)
         return requirements, sdlc
