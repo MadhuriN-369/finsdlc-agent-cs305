@@ -1,6 +1,6 @@
 # Agentic Requirements & SDLC Advisor (with RAG)
 
-A multi-agent system built for **CS305 — 1st Course Project Evaluation**, which
+A multi-agent system built for **CS305 Course Project Evaluation**, which
 requires an Agentic-AI application with **at least two agents** that:
 
 1. Identify and list the software requirements for a given scenario/module.
