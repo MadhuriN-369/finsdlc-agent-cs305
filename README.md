@@ -1,13 +1,14 @@
-# Agentic Requirements & SDLC Advisor
+# Agentic Requirements & SDLC Advisor (with RAG)
 
-A three-agent system built for **CS305 — 1st Course Project Evaluation**,
-which requires an Agentic-AI application with **at least two agents** that:
+A multi-agent system built for **CS305 — 1st Course Project Evaluation**, which
+requires an Agentic-AI application with **at least two agents** that:
+
 1. Identify and list the software requirements for a given scenario/module.
-2. Identify a suitable SDLC for that specification.
+2. Identify a suitable SDLC model for that specification.
 
-This implements that (and adds a third agent that improves the quality of
-step 1) as a small, generic pipeline — not tied to any one scenario — built
-on top of the larger project vision in the problem statement.
+This project implements **three agents** plus an orchestrator, and grounds them
+in a domain knowledge base (currently **Banking**) using **Retrieval-Augmented
+Generation (RAG)**. It is a generic pipeline: it is not tied to any one scenario.
 
 ## How it works
 
@@ -15,40 +16,52 @@ on top of the larger project vision in the problem statement.
 User scenario (plain English)
         │
         ▼
-┌───────────────────────┐
-│  Agent 0               │   -> judges if the scenario has enough detail
-│  Clarification Agent   │   -> if not: asks up to 4 targeted questions
-└───────────┬───────────┘   (user answers, or skips and Agent 1 assumes)
-            │ (scenario, optionally enriched with Q&A)
+┌─────────────────────────┐
+│  RAG retrieval           │  -> embeds the scenario, finds the top-5 most
+│  (rag.py)                │     similar chunks in the banking knowledge base
+└───────────┬─────────────┘
+            │ retrieved regulations / standards
             ▼
-┌───────────────────────┐
-│  Agent 1               │   -> functional requirements
-│  Requirements Agent    │   -> non-functional requirements
-└───────────┬───────────┘   -> assumptions (for anything still unclear)
-            │ (structured JSON)
+┌─────────────────────────┐
+│  Agent 0                 │  -> judges if the scenario has enough detail
+│  Clarification Agent     │  -> if not: asks up to 4 targeted questions
+└───────────┬─────────────┘     (user answers, or skips and Agent 1 assumes)
+            │ scenario (+ Q&A)
             ▼
-┌───────────────────────┐
-│  Agent 2               │   -> fit scores per SDLC model
-│  SDLC Selection Agent  │   -> recommended model + justification
-└───────────────────────┘   -> sketch of a project-specific workflow
+┌─────────────────────────┐
+│  Agent 1                 │  -> functional requirements
+│  Requirements Agent      │  -> non-functional requirements
+└───────────┬─────────────┘  -> assumptions
+            │ structured JSON
+            ▼
+┌─────────────────────────┐
+│  Agent 2                 │  -> fit score (0-100) for 8 SDLC models
+│  SDLC Selection Agent    │  -> recommended model + justification
+└─────────────────────────┘  -> project-specific workflow sketch
 ```
 
-An `Orchestrator` class coordinates the three agents. In the Streamlit app,
-Agent 0 runs first: if the scenario is missing critical details (user
-roles, data sensitivity, scale, integrations, compliance context,
-deployment platform), it pauses the pipeline and shows you its questions
-before Agent 1 ever runs. If the scenario is already clear, it says so and
-the pipeline proceeds straight to Agent 1 → Agent 2, same as before. Each
-agent has its own system prompt (its "role") and its own responsibility —
-this is the minimal version of the multi-agent architecture described in
-the full problem statement (which lists 13 possible agents; this implements
-3 of them end to end, going beyond the "at least two" the checkpoint
-requires).
+An `Orchestrator` class coordinates the agents. Each agent has its own system
+prompt (its role) and its own responsibility.
 
-Both agents call a Hugging Face **hosted** instruction-tuned model through
-the Inference API — **no fine-tuning and no training dataset are used or
-needed.** This matches the "retrieval-free" simplest form of the
-architecture; you can extend it with RAG later for the full project.
+**Agent 2 chooses from:** Waterfall, Iterative Waterfall, V-Shaped, Prototype,
+RAD, Incremental/Iterative, Spiral, Agile.
+
+### RAG (domain knowledge)
+
+1. `knowledge_base/banking.md` is split into paragraph-level chunks, each
+   tagged with its `##` section (e.g. "Lending and Credit Regulations").
+2. Every chunk is embedded **once** with Gemini's embedding model
+   (`gemini-embedding-001`) and stored in a local numpy index
+   (`knowledge_base/_indices/`).
+3. For each scenario, the query is embedded and compared with all chunks by
+   **cosine similarity**; the top 5 chunks are injected into the prompts of
+   Agents 0, 1 and 2.
+4. The UI shows the retrieved chunks (source + relevance) in a collapsible panel,
+   so you can see what the agents were grounded on.
+
+No fine-tuning and no training dataset are used. The LLM is a hosted Google
+Gemini model called through its REST API. No Docker, no native DLLs, and no
+external vector database are needed.
 
 ## Setup
 
@@ -57,57 +70,99 @@ architecture; you can extend it with RAG later for the full project.
    pip install -r requirements.txt
    ```
 
-2. Get a Hugging Face API token (needs "Inference" permission):
-   https://huggingface.co/settings/tokens
+2. Get a Google Gemini API key (free tier available):
+   https://aistudio.google.com/apikey
 
 3. Run the app:
    ```bash
-   streamlit run app.py
+   python -m streamlit run app.py
    ```
-   Paste your token into the sidebar when the app opens in your browser.
+   Paste the key into the sidebar (or set the `GEMINI_API_KEY` environment
+   variable before launching).
 
-   Or, for a quick terminal test without the UI:
+   If the default port is blocked on your machine (Windows `WinError 10013`):
    ```bash
-   export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxx
-   python run_cli.py "A digital bank wants a loan origination module that..."
+   python -m streamlit run app.py --server.address 127.0.0.1 --server.port 3000
    ```
+
+4. In the sidebar, choose **Banking** under *Domain Knowledge (RAG)* and click
+   **Build index** (needed once; click **Rebuild index** after editing the
+   knowledge-base file).
+
+### Command-line alternative (no UI)
+
+```bash
+# PowerShell
+$env:GEMINI_API_KEY="your-key"
+
+# one-time: build the index
+python run_cli.py --domain banking --build-index ""
+
+# run the pipeline with RAG
+python run_cli.py --domain banking "A digital bank wants a loan origination module that..."
+
+# run without RAG
+python run_cli.py "A digital bank wants a loan origination module that..."
+```
 
 ## Choosing a model
 
-`DEFAULT_MODEL` in `agents.py` is set to `meta-llama/Llama-3.1-8B-Instruct`.
-Hugging Face's Inference API routes requests to different backend providers
-depending on your account and model availability, so if you get a "model
-not found" or rate-limit error:
-- Try a different model string in the sidebar (or `HF_MODEL` env var for
-  the CLI) — any instruction-tuned chat model works, e.g.
-  `HuggingFaceH4/zephyr-7b-beta`, `Qwen/Qwen2.5-7B-Instruct`, or a smaller
-  model if you're on a free tier.
-- Optionally set a specific provider (e.g. `hf-inference`, `together`,
-  `groq`) in the sidebar's "Provider" field.
+`DEFAULT_MODEL` in `agents.py` is `gemini-3.1-flash-lite`. You can type any
+other Gemini model name in the sidebar. Google retires old model names, so if
+you get a **404**, list the models your key can use:
+
+```bash
+python -c "import os,requests; r=requests.get('https://generativelanguage.googleapis.com/v1beta/models',params={'key':os.environ['GEMINI_API_KEY'],'pageSize':200}).json(); [print(m['name']) for m in r['models'] if 'generateContent' in m['supportedGenerationMethods']]"
+```
+
+## Troubleshooting
+
+| Error | Meaning | Fix |
+|---|---|---|
+| `404 Not Found` (model URL) | Model name no longer exists | Pick another model name (see above) |
+| `503 Service Unavailable` / `429` | Google is overloaded or rate-limiting | Click Analyse again; the app already retries automatically |
+| `ReadTimeout` | Google took too long to answer | Retry; the app retries automatically (120 s timeout) |
+| `streamlit.exe ... Application Control policy` | Windows blocks the launcher | Use `python -m streamlit run app.py` |
+| `WinError 10013` (port) | Port blocked or reserved | Use `--server.address 127.0.0.1 --server.port 3000` |
+| "index not built yet" | RAG index missing | Click **Build index** in the sidebar |
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `agents.py` | Agent 1, Agent 2, and the Orchestrator (all core logic) |
-| `app.py` | Streamlit UI |
-| `run_cli.py` | Command-line alternative for quick testing |
-| `requirements.txt` | Python dependencies |
+| `agents.py` | Agents 0, 1, 2, the Orchestrator, and the Gemini API call (with retries) |
+| `rag.py` | Local vector store: chunking, Gemini embeddings, cosine-similarity search |
+| `app.py` | Streamlit UI (input → clarification → results, RAG panel) |
+| `run_cli.py` | Command-line version, also used to build the index |
+| `knowledge_base/banking.md` | Banking domain knowledge (lending, KYC/AML, PCI-DSS, security, core banking, risk, digital banking) |
+| `requirements.txt` | Python dependencies (`streamlit`, `requests`, `numpy`) |
+
+Add more domains by dropping a markdown file with `## Section` headings into
+`knowledge_base/` (e.g. `healthcare.md`). It appears in the Domain dropdown
+automatically; click **Build index** once for it.
+
+## Limitations
+
+- The knowledge base is small and hand-written from public summaries of
+  regulations; it is not legal advice or an authoritative source.
+- LLM output is non-deterministic, and no quantitative evaluation has been done.
+- The system depends on an external API, so quota, overload and model
+  retirements can affect it.
 
 ## Extending toward the full project
 
-The full problem statement describes up to 13 agents (Coordinator,
-Stakeholder Interaction, Requirement Extraction, Clarification,
-Classification, Conflict-Detection, Compliance, Security & Privacy,
-Risk-Analysis, SDLC Selection, Documentation, Validation, Human-Approval)
-plus retrieval-grounded generation (RAG) over a financial knowledge base.
-This checkpoint deliberately implements a slice of that: Clarification +
-Requirements + SDLC Selection, run by a simple orchestrator instead of a
-full agent framework. Natural next steps for later checkpoints:
-- Add a small **vector store** (e.g. Chroma) with a handful of synthetic
-  "policy" documents, and have Agent 1/2 retrieve from it (RAG) instead of
-  relying only on the LLM's own knowledge.
-- Add a **Human-Approval** step in the UI (accept/edit/reject buttons)
-  before requirements or the SDLC choice are treated as final.
-- Add a **Conflict-Detection Agent** that checks Agent 1's requirements for
-  internal contradictions before Agent 2 sees them.
+The full problem statement describes up to 13 agents (Coordinator, Stakeholder
+Interaction, Requirement Extraction, Clarification, Classification,
+Conflict-Detection, Compliance, Security & Privacy, Risk-Analysis, SDLC
+Selection, Documentation, Validation, Human-Approval). This version implements
+Clarification + Requirements + SDLC Selection with a simple orchestrator, plus
+RAG. Natural next steps:
+
+- Add a **Human-Approval** step in the UI (accept/edit/reject) before the
+  requirements or SDLC choice are treated as final.
+- Add a **Conflict-Detection Agent** that checks the requirements for internal
+  contradictions before Agent 2 sees them.
+- Add more domains (healthcare, e-commerce) and a larger knowledge base, with a
+  dedicated vector database such as Qdrant.
+- Add a report export (Markdown/PDF) and a quantitative evaluation of
+  requirement quality with and without RAG.
